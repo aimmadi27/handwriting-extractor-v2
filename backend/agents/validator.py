@@ -59,12 +59,13 @@ class ValidatorAgent:
 
         for attempt in range(3):
             try:
-                result = self.llm.generate_json(prompt)
+                result, usage = self.llm.generate_json(prompt)
                 if "document" not in result:
                     result = {
                         "document": doc_clean,
                         "validation": {"overall_confidence": 1.0, "section_issues": []},
                     }
+                result["_usage"] = usage
                 return result
             except Exception as e:
                 log.warning("validator attempt=%d page=%d error=%s", attempt + 1, page_num, e)
@@ -73,6 +74,7 @@ class ValidatorAgent:
                 else:
                     return {
                         "document": doc_clean,
+                        "_usage": {},
                         "validation": {
                             "overall_confidence": 0.0,
                             "section_issues": [{

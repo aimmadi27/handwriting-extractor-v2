@@ -5,15 +5,27 @@ export default function AuthCallback() {
   const navigate = useNavigate();
 
   useEffect(() => {
-    // Token is passed in the URL fragment (#) — fragments are never sent to
-    // servers or logged by proxies, unlike query parameters.
-    const token = window.location.hash.slice(1);
-    if (token) {
-      localStorage.setItem('token', token);
-      navigate('/app', { replace: true });
-    } else {
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('code');
+
+    if (!code) {
       navigate('/', { replace: true });
+      return;
     }
+
+    // Exchange the one-time code for httpOnly access + refresh cookies.
+    // The JWT is set as a cookie by the server — it never touches JS storage.
+    fetch('/api/auth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ code }),
+    })
+      .then((res) => {
+        if (res.ok) navigate('/app', { replace: true });
+        else navigate('/', { replace: true });
+      })
+      .catch(() => navigate('/', { replace: true }));
   }, [navigate]);
 
   return (

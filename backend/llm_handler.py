@@ -6,7 +6,6 @@ import litellm
 from dotenv import load_dotenv
 from json_repair import repair_json
 
-# Silently drop parameters a provider doesn't support (e.g. temperature on o1)
 litellm.drop_params = True
 
 
@@ -22,12 +21,6 @@ class LLMHandler:
         Ollama      ->  LLM_MODEL=ollama/llava                  (no key, runs locally)
         NVIDIA NIM  ->  LLM_MODEL=nvidia_nim/meta/llama-3.2-90b-vision-instruct + NVIDIA_NIM_API_KEY
         Groq        ->  LLM_MODEL=groq/llama-3.2-90b-vision-preview             + GROQ_API_KEY
-        Together AI ->  LLM_MODEL=together_ai/meta-llama/Llama-3.2-90B-Vision-Instruct-Turbo + TOGETHERAI_API_KEY
-        Mistral     ->  LLM_MODEL=mistral/pixtral-large-latest                  + MISTRAL_API_KEY
-        Azure       ->  LLM_MODEL=azure/<your-deployment>       + AZURE_API_KEY + AZURE_API_BASE
-
-    The API key for your chosen provider must be set in .env.
-    LiteLLM reads the correct key automatically based on the model prefix.
     """
 
     def __init__(self):
@@ -39,12 +32,13 @@ class LLMHandler:
                 "Example: LLM_MODEL=gemini/gemini-2.0-flash"
             )
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    def generate(self, prompt: str, image_bytes: bytes = None) -> tuple[str, dict]:
+        """
+        Send a prompt (optionally with an image) and return
+        (response_text, usage_stats).
 
-    def generate(self, prompt: str, image_bytes: bytes = None) -> str:
-        """Send a prompt (optionally with an image) and return the raw text response."""
+        usage_stats keys: input_tokens, output_tokens, cost_usd, model
+        """
         content = []
 
         if image_bytes:
@@ -61,16 +55,25 @@ class LLMHandler:
             messages=[{"role": "user", "content": content}],
             temperature=0.1,
         )
-        return response.choices[0].message.content
 
-    def generate_json(self, prompt: str, image_bytes: bytes = None) -> dict:
-        """Send a prompt and parse the response as JSON."""
-        text = self.generate(prompt, image_bytes)
-        return self._parse_json(text)
+        try:
+            cost_usd = litellm.completion_cost(completion_response=response) or 0.0
+        except Exception:
+            cost_usd = 0.0
 
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
+        usage = {
+            "input_tokens":  getattr(response.usage, "prompt_tokens",     0),
+            "output_tokens": getattr(response.usage, "completion_tokens",  0),
+            "cost_usd":      cost_usd,
+            "model":         self.model,
+        }
+
+        return response.choices[0].message.content, usage
+
+    def generate_json(self, prompt: str, image_bytes: bytes = None) -> tuple[dict, dict]:
+        """Send a prompt and return (parsed_dict, usage_stats)."""
+        text, usage = self.generate(prompt, image_bytes)
+        return self._parse_json(text), usage
 
     def _parse_json(self, text: str) -> dict:
         try:

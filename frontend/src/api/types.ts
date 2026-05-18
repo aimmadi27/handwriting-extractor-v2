@@ -66,9 +66,10 @@ export interface PageResult {
 
 // SSE event shapes
 export type SSEEvent =
-  | { type: 'progress'; page: number; stage: 'parsing' | 'validating' }
-  | { type: 'result'; page: number; data: PageResult }
-  | { type: 'error'; page: number; error: string }
+  | { type: 'progress';       page: number; stage: 'parsing' | 'validating' }
+  | { type: 'result';         page: number; data: PageResult }
+  | { type: 'error';          page: number; error: string }
+  | { type: 'quota_exceeded'; daily_limit: number; reset_at: string }
   | { type: 'done' };
 
 export type ExportFormat = 'pdf' | 'word' | 'excel' | 'json';

@@ -1,12 +1,16 @@
 import json
 import os
+import secrets
+from datetime import date
 from typing import Optional
 
 import redis.asyncio as aioredis
 
 REDIS_URL   = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 UPLOAD_TTL  = int(os.getenv("UPLOAD_TTL_SECONDS", str(2 * 60 * 60)))  # 2 hours
-PKCE_TTL    = 600  # 10 minutes
+PKCE_TTL    = 600    # 10 minutes
+AUTH_CODE_TTL   = 60         # 1 minute — one-time code after OAuth
+REFRESH_TTL = 7 * 24 * 60 * 60  # 7 days
 
 _pool = aioredis.ConnectionPool.from_url(REDIS_URL, max_connections=20)
 
@@ -82,3 +86,54 @@ async def pop_pkce(state: str) -> Optional[str]:
     results = await pipe.execute()
     raw = results[0]
     return raw.decode() if raw else None
+
+
+# ── One-time auth codes (post-OAuth token exchange) ───────────────────────────
+
+async def store_auth_code(code: str, user_info: dict) -> None:
+    await _r().set(f"authcode:{code}", json.dumps(user_info), ex=AUTH_CODE_TTL)
+
+
+async def pop_auth_code(code: str) -> Optional[dict]:
+    """Atomically read and delete a one-time auth code."""
+    r = _r()
+    pipe = r.pipeline()
+    pipe.get(f"authcode:{code}")
+    pipe.delete(f"authcode:{code}")
+    results = await pipe.execute()
+    raw = results[0]
+    return json.loads(raw) if raw else None
+
+
+# ── Refresh tokens ────────────────────────────────────────────────────────────
+
+async def store_refresh_token(token_id: str, user_info: dict) -> None:
+    await _r().set(f"refresh:{token_id}", json.dumps(user_info), ex=REFRESH_TTL)
+
+
+async def get_refresh_token(token_id: str) -> Optional[dict]:
+    raw = await _r().get(f"refresh:{token_id}")
+    return json.loads(raw) if raw else None
+
+
+async def revoke_refresh_token(token_id: str) -> None:
+    await _r().delete(f"refresh:{token_id}")
+
+
+# ── Daily usage counters ──────────────────────────────────────────────────────
+
+async def get_daily_usage(user_sub: str) -> int:
+    key = f"usage:pages:{user_sub}:{date.today().isoformat()}"
+    val = await _r().get(key)
+    return int(val) if val else 0
+
+
+async def increment_daily_usage(user_sub: str) -> int:
+    """Atomically increment and return the new count. Sets 25h TTL on first write."""
+    key = f"usage:pages:{user_sub}:{date.today().isoformat()}"
+    r = _r()
+    pipe = r.pipeline()
+    pipe.incr(key)
+    pipe.expire(key, 25 * 60 * 60)
+    results = await pipe.execute()
+    return int(results[0])

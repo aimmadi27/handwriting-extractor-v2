@@ -100,8 +100,9 @@ class ParserAgent:
 
         for attempt in range(3):
             try:
-                result = self.llm.generate_json(PARSER_PROMPT, image_bytes)
-                result["_page"] = page_num
+                result, usage = self.llm.generate_json(PARSER_PROMPT, image_bytes)
+                result["_page"]  = page_num
+                result["_usage"] = usage
                 return result
             except Exception as e:
                 log.warning("parser attempt=%d page=%d error=%s", attempt + 1, page_num, e)
@@ -112,6 +113,7 @@ class ParserAgent:
                         "doc_type": "other",
                         "title": f"Page {page_num}",
                         "sections": [],
-                        "_page": page_num,
+                        "_page":  page_num,
+                        "_usage": {},
                         "_error": str(e),
                     }

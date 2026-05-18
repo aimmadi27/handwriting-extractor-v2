@@ -2,16 +2,37 @@ import type { UploadResponse, ExportFormat, PageResult } from './types';
 
 const BASE = '/api';
 
-function token(): string | null {
-  return localStorage.getItem('token');
+// ── Fetch wrapper with automatic token refresh ────────────────────────────────
+
+let _refreshing: Promise<boolean> | null = null;
+
+async function _tryRefresh(): Promise<boolean> {
+  if (_refreshing) return _refreshing;
+  _refreshing = fetch(`${BASE}/auth/refresh`, { method: 'POST', credentials: 'include' })
+    .then((r) => r.ok)
+    .catch(() => false)
+    .finally(() => { _refreshing = null; });
+  return _refreshing;
 }
 
-function authHeaders(): HeadersInit {
-  const t = token();
-  return t ? { Authorization: `Bearer ${t}` } : {};
+async function apiFetch(url: string, init?: RequestInit): Promise<Response> {
+  const res = await fetch(url, { ...init, credentials: 'include' });
+
+  // On 401: try a silent token refresh, then retry once.
+  // Skip the retry loop for auth endpoints themselves.
+  if (res.status === 401 && !url.includes('/auth/')) {
+    const refreshed = await _tryRefresh();
+    if (refreshed) {
+      return fetch(url, { ...init, credentials: 'include' });
+    }
+    // Refresh failed — boot to login
+    window.location.href = '/';
+  }
+
+  return res;
 }
 
-async function checkResponse(res: Response) {
+async function checkResponse(res: Response): Promise<Response> {
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body?.detail ?? `HTTP ${res.status}`);
@@ -22,16 +43,18 @@ async function checkResponse(res: Response) {
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
 export async function fetchLoginUrl(): Promise<string> {
-  const res = await checkResponse(await fetch(`${BASE}/auth/login`));
+  const res = await checkResponse(await apiFetch(`${BASE}/auth/login`));
   const data = await res.json();
   return data.url as string;
 }
 
 export async function fetchMe(): Promise<{ email: string; name: string; picture?: string }> {
-  const res = await checkResponse(
-    await fetch(`${BASE}/auth/me`, { headers: authHeaders() })
-  );
+  const res = await checkResponse(await apiFetch(`${BASE}/auth/me`));
   return res.json();
+}
+
+export async function logoutUser(): Promise<void> {
+  await apiFetch(`${BASE}/auth/logout`, { method: 'POST' }).catch(() => {});
 }
 
 // ── Upload ────────────────────────────────────────────────────────────────────
@@ -40,20 +63,13 @@ export async function uploadPdf(file: File): Promise<UploadResponse> {
   const form = new FormData();
   form.append('file', file);
   const res = await checkResponse(
-    await fetch(`${BASE}/upload`, {
-      method: 'POST',
-      headers: authHeaders(),
-      body: form,
-    })
+    await apiFetch(`${BASE}/upload`, { method: 'POST', body: form })
   );
   return res.json();
 }
 
 export async function deleteUpload(uploadId: string): Promise<void> {
-  await fetch(`${BASE}/upload/${uploadId}`, {
-    method: 'DELETE',
-    headers: authHeaders(),
-  });
+  await apiFetch(`${BASE}/upload/${uploadId}`, { method: 'DELETE' });
 }
 
 // ── Extract (SSE) ─────────────────────────────────────────────────────────────
@@ -64,19 +80,15 @@ export function extractPages(
   onEvent: (e: import('./types').SSEEvent) => void,
   onError: (msg: string) => void
 ): () => void {
-  const t = token();
   const controller = new AbortController();
 
   (async () => {
     try {
       const res = await checkResponse(
-        await fetch(`${BASE}/extract`, {
+        await apiFetch(`${BASE}/extract`, {
           method: 'POST',
           signal: controller.signal,
-          headers: {
-            'Content-Type': 'application/json',
-            ...(t ? { Authorization: `Bearer ${t}` } : {}),
-          },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ upload_id: uploadId, page_nums: pageNums }),
         })
       );
@@ -94,8 +106,7 @@ export function extractPages(
         for (const line of lines) {
           if (line.startsWith('data: ')) {
             try {
-              const evt = JSON.parse(line.slice(6));
-              onEvent(evt);
+              onEvent(JSON.parse(line.slice(6)));
             } catch {
               // skip malformed lines
             }
@@ -130,12 +141,9 @@ export async function exportDocument(
   reviewData: Record<string, PageResult>
 ): Promise<void> {
   const res = await checkResponse(
-    await fetch(`${BASE}/export/${format}`, {
+    await apiFetch(`${BASE}/export/${format}`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...authHeaders(),
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ review_data: reviewData }),
     })
   );

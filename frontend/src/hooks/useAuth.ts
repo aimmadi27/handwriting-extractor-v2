@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { fetchMe } from '../api/client';
+import { fetchMe, logoutUser } from '../api/client';
 
 export interface AuthUser {
   email: string;
@@ -12,20 +12,17 @@ export function useAuth() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const token = localStorage.getItem('token');
-    if (!token) {
-      setLoading(false);
-      return;
-    }
+    // Session is determined entirely by the httpOnly cookie — no localStorage.
     fetchMe()
       .then(setUser)
-      .catch(() => localStorage.removeItem('token'))
+      .catch(() => setUser(null))
       .finally(() => setLoading(false));
   }, []);
 
-  function logout() {
-    localStorage.removeItem('token');
+  async function logout() {
+    await logoutUser();
     setUser(null);
+    window.location.href = '/';
   }
 
   return { user, loading, logout };

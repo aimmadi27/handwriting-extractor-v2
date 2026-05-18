@@ -1,11 +1,13 @@
+import base64
 import io
 import os
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
 from pdf2image import convert_from_bytes
 
 from dependencies import get_current_user
+from limiter import limiter
 from logger import get_logger
 import storage
 
@@ -13,12 +15,14 @@ router = APIRouter()
 log = get_logger(__name__)
 
 THUMBNAIL_MAX    = (420, 600)
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB",  "50"))  * 1024 * 1024
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB",  "50")) * 1024 * 1024
 MAX_PAGES        = int(os.getenv("MAX_PAGES", "50"))
 
 
 @router.post("")
+@limiter.limit("20/minute")
 async def upload_pdf(
+    request: Request,
     file: UploadFile = File(...),
     user: dict = Depends(get_current_user),
 ):
@@ -57,7 +61,6 @@ async def upload_pdf(
         thumb.thumbnail(THUMBNAIL_MAX)
         thumb_buf = io.BytesIO()
         thumb.save(thumb_buf, "PNG")
-        import base64
         thumbnails.append(base64.b64encode(thumb_buf.getvalue()).decode())
 
     await storage.store_upload(upload_id, file.filename, page_images)

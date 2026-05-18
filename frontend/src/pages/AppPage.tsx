@@ -32,6 +32,7 @@ export default function AppPage() {
   const [pageStatuses, setPageStatuses] = useState<Record<number, PageStatus>>({});
   const [extracting, setExtracting] = useState(false);
   const [extractDone, setExtractDone] = useState(false);
+  const [quotaMsg, setQuotaMsg] = useState('');
   const cancelRef = useRef<(() => void) | null>(null);
 
   // Review state
@@ -98,6 +99,13 @@ export default function AppPage() {
           setResults((prev) => ({ ...prev, [String(evt.page)]: evt.data }));
           setActivePage(evt.page);
         }
+        if (evt.type === 'quota_exceeded') {
+          setQuotaMsg(
+            `Daily limit of ${evt.daily_limit} pages reached. Resets at ${new Date(evt.reset_at).toLocaleTimeString()}.`
+          );
+          setExtracting(false);
+          setExtractDone(true);
+        }
         if (evt.type === 'done') {
           setExtracting(false);
           setExtractDone(true);
@@ -128,6 +136,7 @@ export default function AppPage() {
     setExtracting(false);
     setExtractDone(false);
     setUploadError('');
+    setQuotaMsg('');
   }
 
   const resultPages = Object.keys(results).map(Number).sort((a, b) => a - b);
@@ -149,7 +158,7 @@ export default function AppPage() {
           {user?.picture && <img src={user.picture} alt="" className="w-7 h-7 rounded-full" />}
           <span className="text-sm text-slate-600 hidden sm:inline">{user?.name}</span>
           <button
-            onClick={() => { logout(); navigate('/'); }}
+            onClick={logout}
             className="text-sm text-slate-500 hover:text-slate-800 transition"
           >
             Sign out
@@ -253,6 +262,12 @@ export default function AppPage() {
                 </button>
               )}
             </div>
+
+            {quotaMsg && (
+              <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 text-sm text-amber-800">
+                {quotaMsg}
+              </div>
+            )}
 
             <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
               <ProgressFeed
