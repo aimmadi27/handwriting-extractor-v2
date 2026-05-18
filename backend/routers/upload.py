@@ -6,9 +6,11 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
 from pdf2image import convert_from_bytes
 
+from database import AsyncSessionLocal
 from dependencies import get_current_user
 from limiter import limiter
 from logger import get_logger
+from models import Document
 import storage
 
 router = APIRouter()
@@ -65,10 +67,22 @@ async def upload_pdf(
 
     await storage.store_upload(upload_id, file.filename, page_images)
 
-    log.info("upload stored upload_id=%s pages=%d user=%s", upload_id, len(pages), user.get("email"))
+    # Persist a document record so the extraction can be retrieved later
+    user_db_id = uuid.UUID(user["user_id"])
+    doc = Document(user_id=user_db_id, filename=file.filename, total_pages=len(pages), status="uploaded")
+    async with AsyncSessionLocal() as db:
+        db.add(doc)
+        await db.commit()
+        await db.refresh(doc)
+
+    log.info(
+        "upload stored upload_id=%s document_id=%s pages=%d user=%s",
+        upload_id, doc.id, len(pages), user.get("email"),
+    )
 
     return {
         "upload_id":   upload_id,
+        "document_id": str(doc.id),
         "filename":    file.filename,
         "total_pages": len(pages),
         "thumbnails":  thumbnails,

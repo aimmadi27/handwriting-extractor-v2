@@ -1,4 +1,7 @@
-import type { UploadResponse, ExportFormat, PageResult } from './types';
+import type {
+  UploadResponse, ExportFormat, PageResult,
+  DocumentListResponse, DocumentDetail,
+} from './types';
 
 const BASE = '/api';
 
@@ -78,7 +81,8 @@ export function extractPages(
   uploadId: string,
   pageNums: number[],
   onEvent: (e: import('./types').SSEEvent) => void,
-  onError: (msg: string) => void
+  onError: (msg: string) => void,
+  documentId?: string
 ): () => void {
   const controller = new AbortController();
 
@@ -89,7 +93,11 @@ export function extractPages(
           method: 'POST',
           signal: controller.signal,
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ upload_id: uploadId, page_nums: pageNums }),
+          body: JSON.stringify({
+            upload_id: uploadId,
+            page_nums: pageNums,
+            ...(documentId ? { document_id: documentId } : {}),
+          }),
         })
       );
 
@@ -121,6 +129,38 @@ export function extractPages(
   })();
 
   return () => controller.abort();
+}
+
+// ── Documents ─────────────────────────────────────────────────────────────────
+
+export async function listDocuments(page = 1, perPage = 20): Promise<DocumentListResponse> {
+  const res = await checkResponse(
+    await apiFetch(`${BASE}/documents?page=${page}&per_page=${perPage}`)
+  );
+  return res.json();
+}
+
+export async function getDocument(documentId: string): Promise<DocumentDetail> {
+  const res = await checkResponse(await apiFetch(`${BASE}/documents/${documentId}`));
+  return res.json();
+}
+
+export async function deleteDocument(documentId: string): Promise<void> {
+  await checkResponse(await apiFetch(`${BASE}/documents/${documentId}`, { method: 'DELETE' }));
+}
+
+export async function savePageResult(
+  documentId: string,
+  pageNum: number,
+  data: Pick<PageResult, 'title' | 'sections' | 'validation'>
+): Promise<void> {
+  await checkResponse(
+    await apiFetch(`${BASE}/documents/${documentId}/pages/${pageNum}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    })
+  );
 }
 
 // ── Export ────────────────────────────────────────────────────────────────────

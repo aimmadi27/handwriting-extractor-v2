@@ -1,8 +1,34 @@
 export interface UploadResponse {
   upload_id: string;
+  document_id: string;
   filename: string;
   total_pages: number;
   thumbnails: string[]; // base64 PNG per page
+}
+
+export interface DocumentSummary {
+  id: string;
+  filename: string;
+  total_pages: number;
+  extracted_pages: number;
+  status: string;
+  created_at: string;
+}
+
+export interface DocumentListResponse {
+  items: DocumentSummary[];
+  total: number;
+  page: number;
+  per_page: number;
+}
+
+export interface DocumentDetail {
+  id: string;
+  filename: string;
+  total_pages: number;
+  status: string;
+  created_at: string;
+  pages: Record<string, PageResult & { edited: boolean; updated_at: string }>;
 }
 
 export interface Pair {

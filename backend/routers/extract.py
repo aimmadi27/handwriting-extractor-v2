@@ -1,17 +1,22 @@
 import asyncio
 import json
 import os
-from datetime import date, timezone, datetime
-from typing import List
+import uuid
+from datetime import date, timezone, datetime, timedelta
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sse_starlette.sse import EventSourceResponse
 
+from database import AsyncSessionLocal
 from dependencies import get_current_user
 from limiter import limiter
 from llm_handler import LLMHandler
 from logger import get_logger
+from models import Document, Page
 from orchestrator import Orchestrator
 import storage
 
@@ -22,8 +27,9 @@ MAX_PAGES_PER_DAY = int(os.getenv("MAX_PAGES_PER_DAY", "100"))
 
 
 class ExtractRequest(BaseModel):
-    upload_id: str
-    page_nums: List[int]
+    upload_id:   str
+    document_id: Optional[str] = None  # persists pages to DB when provided
+    page_nums:   List[int]
 
 
 def _event(data: dict) -> dict:
@@ -31,11 +37,47 @@ def _event(data: dict) -> dict:
 
 
 def _quota_reset_iso() -> str:
-    """ISO timestamp for midnight tonight UTC."""
-    today = date.today()
+    today    = date.today()
     midnight = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
-    from datetime import timedelta
     return (midnight + timedelta(days=1)).isoformat()
+
+
+async def _upsert_page(document_id: str, page_num: int, result: dict) -> None:
+    doc_uuid = uuid.UUID(document_id)
+    async with AsyncSessionLocal() as db:
+        stmt = (
+            pg_insert(Page)
+            .values(
+                document_id=doc_uuid,
+                page_num=page_num,
+                doc_type=result["doc_type"],
+                title=result["title"],
+                sections=result["sections"],
+                validation=result["validation"],
+            )
+            .on_conflict_do_update(
+                index_elements=["document_id", "page_num"],
+                set_={
+                    "doc_type":   result["doc_type"],
+                    "title":      result["title"],
+                    "sections":   result["sections"],
+                    "validation": result["validation"],
+                    "updated_at": datetime.now(timezone.utc),
+                },
+            )
+        )
+        await db.execute(stmt)
+        await db.commit()
+
+
+async def _mark_document_done(document_id: str) -> None:
+    doc_uuid = uuid.UUID(document_id)
+    async with AsyncSessionLocal() as db:
+        doc = await db.get(Document, doc_uuid)
+        if doc:
+            doc.status     = "done"
+            doc.updated_at = datetime.now(timezone.utc)
+            await db.commit()
 
 
 @router.post("")
@@ -62,6 +104,15 @@ async def extract(
     meta     = await storage.get_upload_meta(body.upload_id)
     user_sub = user.get("sub", "anonymous")
 
+    # Mark document as extracting
+    if body.document_id:
+        doc_uuid = uuid.UUID(body.document_id)
+        async with AsyncSessionLocal() as db:
+            doc = await db.get(Document, doc_uuid)
+            if doc:
+                doc.status = "extracting"
+                await db.commit()
+
     try:
         llm          = LLMHandler()
         orchestrator = Orchestrator(llm)
@@ -69,15 +120,16 @@ async def extract(
         raise HTTPException(status_code=500, detail=f"LLM initialisation failed: {e}")
 
     loop = asyncio.get_event_loop()
-
     log.info(
-        "extraction started upload_id=%s pages=%s user=%s",
-        body.upload_id, body.page_nums, user.get("email"),
+        "extraction started upload_id=%s document_id=%s pages=%s user=%s",
+        body.upload_id, body.document_id, body.page_nums, user.get("email"),
     )
 
     async def generator():
+        pages_done = 0
+
         for page_num in sorted(body.page_nums):
-            # ── Quota check (per page, atomic increment) ──────────────────────
+            # ── Quota check ───────────────────────────────────────────────────
             daily_used = await storage.get_daily_usage(user_sub)
             if daily_used >= MAX_PAGES_PER_DAY:
                 log.warning(
@@ -122,17 +174,16 @@ async def extract(
                 yield _event({"type": "error", "page": page_num, "error": str(e)})
                 continue
 
-            # ── Extract usage stats before building result ─────────────────────
+            # ── Usage stats ───────────────────────────────────────────────────
             parser_usage    = parsed.pop("_usage", {})
             validator_usage = validated.pop("_usage", {})
-
-            total_in  = parser_usage.get("input_tokens",  0) + validator_usage.get("input_tokens",  0)
-            total_out = parser_usage.get("output_tokens", 0) + validator_usage.get("output_tokens", 0)
             total_cost = parser_usage.get("cost_usd", 0.0) + validator_usage.get("cost_usd", 0.0)
-
             log.info(
                 "page_usage upload_id=%s page=%d tokens_in=%d tokens_out=%d cost_usd=%.4f",
-                body.upload_id, page_num, total_in, total_out, total_cost,
+                body.upload_id, page_num,
+                parser_usage.get("input_tokens", 0) + validator_usage.get("input_tokens", 0),
+                parser_usage.get("output_tokens", 0) + validator_usage.get("output_tokens", 0),
+                total_cost,
             )
 
             # ── Build result ──────────────────────────────────────────────────
@@ -150,13 +201,21 @@ async def extract(
             await storage.store_result(body.upload_id, page_num, result)
             await storage.increment_daily_usage(user_sub)
 
+            # Persist page to DB if document_id was provided
+            if body.document_id:
+                await _upsert_page(body.document_id, page_num, result)
+
+            pages_done += 1
             log.info(
                 "page extracted upload_id=%s page=%d confidence=%.2f",
                 body.upload_id, page_num,
                 result["validation"].get("overall_confidence", 0),
             )
-
             yield _event({"type": "result", "page": page_num, "data": result})
+
+        # Mark document done in DB
+        if body.document_id and pages_done > 0:
+            await _mark_document_done(body.document_id)
 
         yield _event({"type": "done"})
         log.info("extraction complete upload_id=%s", body.upload_id)

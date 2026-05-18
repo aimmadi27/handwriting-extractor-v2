@@ -1,5 +1,20 @@
 services:
 
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: handwriting
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -17,10 +32,13 @@ services:
     env_file: ./backend/.env
     environment:
       REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/handwriting
     ports:
       - "8000:8000"
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
   frontend:
@@ -33,3 +51,4 @@ services:
 
 volumes:
   redis_data:
+  postgres_data:

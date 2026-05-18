@@ -13,13 +13,16 @@ from google.auth.transport import requests as google_requests
 from jose import JWTError, jwt
 from pydantic import BaseModel
 
+from database import AsyncSessionLocal
 from dependencies import get_current_user
 from logger import get_logger
+from models import User
 from storage import (
     store_pkce, pop_pkce,
     store_auth_code, pop_auth_code,
     store_refresh_token, get_refresh_token, revoke_refresh_token,
 )
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 router = APIRouter()
 log = get_logger(__name__)
@@ -168,6 +171,32 @@ class TokenRequest(BaseModel):
     code: str
 
 
+async def _upsert_user(user_info: dict) -> uuid.UUID:
+    """Upsert the user in Postgres and return their DB UUID."""
+    async with AsyncSessionLocal() as db:
+        stmt = (
+            pg_insert(User)
+            .values(
+                google_sub=user_info["sub"],
+                email=user_info["email"],
+                name=user_info.get("name"),
+                picture=user_info.get("picture"),
+            )
+            .on_conflict_do_update(
+                index_elements=["google_sub"],
+                set_={
+                    "last_seen": datetime.now(timezone.utc),
+                    "name":      user_info.get("name"),
+                    "picture":   user_info.get("picture"),
+                },
+            )
+            .returning(User.id)
+        )
+        result = await db.execute(stmt)
+        await db.commit()
+        return result.scalar_one()
+
+
 @router.post("/token")
 async def token(body: TokenRequest):
     """
@@ -177,6 +206,10 @@ async def token(body: TokenRequest):
     user_info = await pop_auth_code(body.code)
     if not user_info:
         raise HTTPException(status_code=400, detail="Invalid or expired auth code.")
+
+    # Upsert user in Postgres; embed their DB UUID in the token for fast lookups
+    user_db_id = await _upsert_user(user_info)
+    user_info["user_id"] = str(user_db_id)
 
     access_token  = _make_access_token(user_info)
     token_id      = str(uuid.uuid4())

@@ -1,8 +1,9 @@
 import { useState, useCallback, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { uploadPdf, deleteUpload, extractPages } from '../api/client';
+import { useNavigate, Link } from 'react-router-dom';
+import { uploadPdf, deleteUpload, extractPages, savePageResult } from '../api/client';
 import type { UploadResponse, PageResult, SSEEvent } from '../api/types';
 import { useAuth } from '../hooks/useAuth';
+import { useDebounce } from '../hooks/useDebounce';
 import PagePicker from '../components/PagePicker';
 import ProgressFeed, { eventToStatus } from '../components/ProgressFeed';
 import SectionEditor from '../components/SectionEditor';
@@ -21,6 +22,8 @@ export default function AppPage() {
 
   // Upload state
   const [upload, setUpload] = useState<UploadResponse | null>(null);
+  const [documentId, setDocumentId] = useState<string | null>(null);
+  const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | ''>('');
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState('');
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -63,6 +66,7 @@ export default function AppPage() {
     try {
       const res = await uploadPdf(file);
       setUpload(res);
+      setDocumentId(res.document_id ?? null);
       setSelected(new Set(Array.from({ length: res.total_pages }, (_, i) => i + 1)));
       setStep('upload');
     } catch (e: unknown) {
@@ -94,6 +98,7 @@ export default function AppPage() {
       upload.upload_id,
       pageNums,
       (evt: SSEEvent) => {
+        setSaveStatus('');
         setPageStatuses((prev) => eventToStatus(evt, prev));
         if (evt.type === 'result') {
           setResults((prev) => ({ ...prev, [String(evt.page)]: evt.data }));
@@ -114,7 +119,8 @@ export default function AppPage() {
       (msg) => {
         setExtracting(false);
         setUploadError(msg);
-      }
+      },
+      documentId ?? undefined
     );
   }
 
@@ -124,11 +130,32 @@ export default function AppPage() {
     setActivePage(firstPage);
   }
 
+  // ── Auto-save current page after 1 s of inactivity ─────────────────────────
+  useDebounce(results[String(activePage)], 1000, async (pageData) => {
+    if (!documentId || !pageData || saveStatus !== 'saving') return;
+    try {
+      await savePageResult(documentId, activePage, {
+        title:      pageData.title,
+        sections:   pageData.sections,
+        validation: pageData.validation,
+      });
+      setSaveStatus('saved');
+    } catch {
+      setSaveStatus('');
+    }
+  });
+
+  const handlePageChange = useCallback((updated: PageResult) => {
+    setResults((prev) => ({ ...prev, [String(activePage)]: updated }));
+    setSaveStatus('saving');
+  }, [activePage]);
+
   // ── Reset ───────────────────────────────────────────────────────────────────
   function reset() {
     if (upload) deleteUpload(upload.upload_id);
     cancelRef.current?.();
     setUpload(null);
+    setDocumentId(null);
     setSelected(new Set());
     setStep('upload');
     setPageStatuses({});
@@ -137,6 +164,7 @@ export default function AppPage() {
     setExtractDone(false);
     setUploadError('');
     setQuotaMsg('');
+    setSaveStatus('');
   }
 
   const resultPages = Object.keys(results).map(Number).sort((a, b) => a - b);
@@ -145,16 +173,23 @@ export default function AppPage() {
     <div className="min-h-screen bg-slate-50 flex flex-col">
       {/* Navbar */}
       <header className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between shadow-sm">
-        <div className="flex items-center gap-2">
-          <div className="w-8 h-8 bg-indigo-500 rounded-lg flex items-center justify-center">
-            <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m0 12.75h7.5M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z" />
-            </svg>
+        <div className="flex items-center gap-4">
+          <div className="flex items-center gap-2">
+            <div className="w-8 h-8 bg-indigo-500 rounded-lg flex items-center justify-center">
+              <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                  d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m0 12.75h7.5M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z" />
+              </svg>
+            </div>
+            <span className="font-semibold text-slate-800">Handwriting Extractor</span>
           </div>
-          <span className="font-semibold text-slate-800">Handwriting Extractor</span>
+          <Link to="/history" className="text-sm text-slate-500 hover:text-slate-800 transition hidden sm:inline">
+            History
+          </Link>
         </div>
         <div className="flex items-center gap-3">
+          {saveStatus === 'saving' && <span className="text-xs text-slate-400">Saving…</span>}
+          {saveStatus === 'saved'  && <span className="text-xs text-emerald-500">Saved</span>}
           {user?.picture && <img src={user.picture} alt="" className="w-7 h-7 rounded-full" />}
           <span className="text-sm text-slate-600 hidden sm:inline">{user?.name}</span>
           <button
@@ -336,9 +371,7 @@ export default function AppPage() {
                 {results[String(activePage)] ? (
                   <SectionEditor
                     page={results[String(activePage)]}
-                    onChange={(updated) =>
-                      setResults((prev) => ({ ...prev, [String(activePage)]: updated }))
-                    }
+                    onChange={handlePageChange}
                   />
                 ) : (
                   <p className="text-sm text-slate-400">No data for this page.</p>

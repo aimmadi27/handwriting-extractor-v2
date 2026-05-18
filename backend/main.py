@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 from limiter import limiter
 from logger import setup_logging, set_request_id, reset_request_id, new_request_id
-from routers import auth, upload, extract, export
+from routers import auth, upload, extract, export, documents
 
 load_dotenv()
 setup_logging()
@@ -57,7 +57,8 @@ async def request_id_middleware(request: Request, call_next):
 app.include_router(auth.router,    prefix="/auth",    tags=["auth"])
 app.include_router(upload.router,  prefix="/upload",  tags=["upload"])
 app.include_router(extract.router, prefix="/extract", tags=["extract"])
-app.include_router(export.router,  prefix="/export",  tags=["export"])
+app.include_router(export.router,     prefix="/export",    tags=["export"])
+app.include_router(documents.router,  prefix="/documents", tags=["documents"])
 
 
 @app.get("/health", tags=["health"])
