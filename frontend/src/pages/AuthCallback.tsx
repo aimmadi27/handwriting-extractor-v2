@@ -5,8 +5,9 @@ export default function AuthCallback() {
   const navigate = useNavigate();
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const token = params.get('token');
+    // Token is passed in the URL fragment (#) — fragments are never sent to
+    // servers or logged by proxies, unlike query parameters.
+    const token = window.location.hash.slice(1);
     if (token) {
       localStorage.setItem('token', token);
       navigate('/app', { replace: true });

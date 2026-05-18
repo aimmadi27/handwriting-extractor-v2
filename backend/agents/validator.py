@@ -1,6 +1,10 @@
 import json
 import time
 
+from logger import get_logger
+
+log = get_logger(__name__)
+
 # Split into two parts so no template substitution is needed at all.
 # The extracted JSON is inserted between them via plain concatenation.
 
@@ -48,7 +52,7 @@ class ValidatorAgent:
 
     def validate(self, parsed: dict, page_num: int) -> dict:
         """Validate the parsed document structure and return corrected doc + issue report."""
-        print(f"[Validator] Validating page {page_num}...")
+        log.info("validating page=%d", page_num)
 
         doc_clean = {k: v for k, v in parsed.items() if not k.startswith("_")}
         prompt = _PROMPT_HEAD + json.dumps(doc_clean, indent=2) + _PROMPT_TAIL
@@ -63,7 +67,7 @@ class ValidatorAgent:
                     }
                 return result
             except Exception as e:
-                print(f"[Validator] Page {page_num} attempt {attempt + 1} failed: {e}")
+                log.warning("validator attempt=%d page=%d error=%s", attempt + 1, page_num, e)
                 if attempt < 2:
                     time.sleep(2 ** attempt)
                 else:

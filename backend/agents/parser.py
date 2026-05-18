@@ -1,5 +1,9 @@
 import time
 
+from logger import get_logger
+
+log = get_logger(__name__)
+
 PARSER_PROMPT = """
 You are an expert document parser and OCR assistant.
 You will receive an image of a handwritten or filled document page.
@@ -92,7 +96,7 @@ class ParserAgent:
         Classify the document type and extract its full content
         as a structured section list in a single LLM call.
         """
-        print(f"[Parser] Processing page {page_num}...")
+        log.info("parsing page=%d", page_num)
 
         for attempt in range(3):
             try:
@@ -100,7 +104,7 @@ class ParserAgent:
                 result["_page"] = page_num
                 return result
             except Exception as e:
-                print(f"[Parser] Page {page_num} attempt {attempt + 1} failed: {e}")
+                log.warning("parser attempt=%d page=%d error=%s", attempt + 1, page_num, e)
                 if attempt < 2:
                     time.sleep(2 ** attempt)
                 else:
