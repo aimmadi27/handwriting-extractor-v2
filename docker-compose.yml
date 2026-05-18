@@ -41,6 +41,20 @@ services:
       postgres:
         condition: service_healthy
 
+  worker:
+    build: ./backend
+    restart: unless-stopped
+    command: ["arq", "worker.WorkerSettings"]
+    env_file: ./backend/.env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/handwriting
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
   frontend:
     build: ./frontend
     restart: unless-stopped

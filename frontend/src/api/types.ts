@@ -99,3 +99,9 @@ export type SSEEvent =
   | { type: 'done' };
 
 export type ExportFormat = 'pdf' | 'word' | 'excel' | 'json';
+
+export interface DocumentStatus {
+  status: 'uploaded' | 'extracting' | 'done';
+  total_pages: number;
+  extracted_pages: number;
+}

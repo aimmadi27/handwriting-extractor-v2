@@ -1,6 +1,6 @@
 import type {
   UploadResponse, ExportFormat, PageResult,
-  DocumentListResponse, DocumentDetail,
+  DocumentListResponse, DocumentDetail, DocumentStatus,
 } from './types';
 
 const BASE = '/api';
@@ -145,8 +145,23 @@ export async function getDocument(documentId: string): Promise<DocumentDetail> {
   return res.json();
 }
 
+export async function getDocumentStatus(documentId: string): Promise<DocumentStatus> {
+  const res = await checkResponse(await apiFetch(`${BASE}/documents/${documentId}/status`));
+  return res.json();
+}
+
 export async function deleteDocument(documentId: string): Promise<void> {
   await checkResponse(await apiFetch(`${BASE}/documents/${documentId}`, { method: 'DELETE' }));
+}
+
+export async function renameDocument(documentId: string, filename: string): Promise<void> {
+  await checkResponse(
+    await apiFetch(`${BASE}/documents/${documentId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename }),
+    })
+  );
 }
 
 export async function savePageResult(

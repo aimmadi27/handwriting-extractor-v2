@@ -5,30 +5,32 @@ import uuid
 from datetime import date, timezone, datetime, timedelta
 from typing import List, Optional
 
+import redis.asyncio as aioredis
+from arq import create_pool
+from arq.connections import RedisSettings
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sse_starlette.sse import EventSourceResponse
 
 from database import AsyncSessionLocal
 from dependencies import get_current_user
 from limiter import limiter
-from llm_handler import LLMHandler
 from logger import get_logger
-from models import Document, Page
-from orchestrator import Orchestrator
+from models import Document
 import storage
 
 router = APIRouter()
 log = get_logger(__name__)
 
-MAX_PAGES_PER_DAY = int(os.getenv("MAX_PAGES_PER_DAY", "100"))
+REDIS_URL          = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+MAX_PAGES_PER_DAY  = int(os.getenv("MAX_PAGES_PER_DAY", "100"))
+ARQ_REDIS_SETTINGS = RedisSettings.from_dsn(REDIS_URL)
+SSE_TIMEOUT_SECS   = 600  # 10-minute hard cap on open SSE connections
 
 
 class ExtractRequest(BaseModel):
     upload_id:   str
-    document_id: Optional[str] = None  # persists pages to DB when provided
+    document_id: Optional[str] = None
     page_nums:   List[int]
 
 
@@ -42,44 +44,6 @@ def _quota_reset_iso() -> str:
     return (midnight + timedelta(days=1)).isoformat()
 
 
-async def _upsert_page(document_id: str, page_num: int, result: dict) -> None:
-    doc_uuid = uuid.UUID(document_id)
-    async with AsyncSessionLocal() as db:
-        stmt = (
-            pg_insert(Page)
-            .values(
-                document_id=doc_uuid,
-                page_num=page_num,
-                doc_type=result["doc_type"],
-                title=result["title"],
-                sections=result["sections"],
-                validation=result["validation"],
-            )
-            .on_conflict_do_update(
-                index_elements=["document_id", "page_num"],
-                set_={
-                    "doc_type":   result["doc_type"],
-                    "title":      result["title"],
-                    "sections":   result["sections"],
-                    "validation": result["validation"],
-                    "updated_at": datetime.now(timezone.utc),
-                },
-            )
-        )
-        await db.execute(stmt)
-        await db.commit()
-
-
-async def _mark_document_done(document_id: str) -> None:
-    doc_uuid = uuid.UUID(document_id)
-    async with AsyncSessionLocal() as db:
-        doc = await db.get(Document, doc_uuid)
-        if doc:
-            doc.status     = "done"
-            doc.updated_at = datetime.now(timezone.utc)
-            await db.commit()
-
-
 @router.post("")
 @limiter.limit("10/minute")
 async def extract(
@@ -88,8 +52,8 @@ async def extract(
     user: dict = Depends(get_current_user),
 ):
     """
-    Run the Parser + Validator agents on the requested pages and stream
-    progress events back to the client via Server-Sent Events (SSE).
+    Enqueue page-extraction jobs in the ARQ worker and stream progress via SSE.
+    Extraction continues in the background even if the SSE connection drops.
 
     Event types:
       {"type": "progress",       "page": N, "stage": "parsing"|"validating"}
@@ -104,120 +68,109 @@ async def extract(
     meta     = await storage.get_upload_meta(body.upload_id)
     user_sub = user.get("sub", "anonymous")
 
-    # Mark document as extracting
-    if body.document_id:
-        doc_uuid = uuid.UUID(body.document_id)
+    # ── Quota check ───────────────────────────────────────────────────────────
+    daily_used      = await storage.get_daily_usage(user_sub)
+    remaining_quota = max(0, MAX_PAGES_PER_DAY - daily_used)
+    valid_pages     = [p for p in sorted(body.page_nums) if 1 <= p <= meta["total_pages"]]
+
+    # ── Reconnect: pages already cached in Redis skip re-enqueuing ────────────
+    already_done: dict[int, dict] = {}
+    needs_processing: list[int]   = []
+    for page_num in valid_pages:
+        cached = await storage.get_result(body.upload_id, page_num)
+        if cached:
+            already_done[page_num] = cached
+        else:
+            needs_processing.append(page_num)
+
+    quota_hit        = len(needs_processing) > remaining_quota
+    pages_to_enqueue = needs_processing[:remaining_quota]
+    total_enqueued   = len(pages_to_enqueue)
+
+    # ── Mark document as extracting ───────────────────────────────────────────
+    if body.document_id and pages_to_enqueue:
         async with AsyncSessionLocal() as db:
-            doc = await db.get(Document, doc_uuid)
+            doc = await db.get(Document, uuid.UUID(body.document_id))
             if doc:
                 doc.status = "extracting"
                 await db.commit()
 
-    try:
-        llm          = LLMHandler()
-        orchestrator = Orchestrator(llm)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM initialisation failed: {e}")
+    # ── Enqueue jobs (set counter BEFORE enqueuing to avoid race) ─────────────
+    if pages_to_enqueue:
+        r = aioredis.Redis.from_url(REDIS_URL)
+        await r.set(f"extraction:{body.upload_id}:remaining", total_enqueued, ex=3600)
+        await r.aclose()
 
-    loop = asyncio.get_event_loop()
+        pool = await create_pool(ARQ_REDIS_SETTINGS)
+        for page_num in pages_to_enqueue:
+            await pool.enqueue_job(
+                "extract_page",
+                body.upload_id,
+                body.document_id,
+                page_num,
+                user_sub,
+            )
+        await pool.aclose()
+
     log.info(
-        "extraction started upload_id=%s document_id=%s pages=%s user=%s",
-        body.upload_id, body.document_id, body.page_nums, user.get("email"),
+        "extraction queued upload_id=%s document_id=%s enqueued=%s reconnect_pages=%s user=%s",
+        body.upload_id, body.document_id, pages_to_enqueue,
+        list(already_done.keys()), user.get("email"),
     )
 
+    # ── SSE stream ────────────────────────────────────────────────────────────
     async def generator():
-        pages_done = 0
+        # Re-emit cached results immediately (supports browser reconnect)
+        for page_num, result in sorted(already_done.items()):
+            yield _event({"type": "result", "page": page_num, "data": result})
 
-        for page_num in sorted(body.page_nums):
-            # ── Quota check ───────────────────────────────────────────────────
-            daily_used = await storage.get_daily_usage(user_sub)
-            if daily_used >= MAX_PAGES_PER_DAY:
-                log.warning(
-                    "quota exceeded user=%s daily_used=%d limit=%d",
-                    user_sub, daily_used, MAX_PAGES_PER_DAY,
-                )
+        if not pages_to_enqueue:
+            if quota_hit:
                 yield _event({
                     "type":        "quota_exceeded",
                     "daily_limit": MAX_PAGES_PER_DAY,
                     "reset_at":    _quota_reset_iso(),
                 })
-                break
+            yield _event({"type": "done"})
+            return
 
-            if page_num < 1 or page_num > meta["total_pages"]:
-                yield _event({"type": "error", "page": page_num, "error": "Page number out of range."})
-                continue
+        # Subscribe to Redis pub/sub channel — worker publishes events here
+        r = aioredis.Redis.from_url(REDIS_URL)
+        pubsub = r.pubsub()
+        await pubsub.subscribe(f"extraction:{body.upload_id}")
 
-            img_bytes = await storage.get_page_image(body.upload_id, page_num)
-            if img_bytes is None:
-                yield _event({"type": "error", "page": page_num, "error": "Page image not found."})
-                continue
+        received = 0
+        loop     = asyncio.get_event_loop()
+        deadline = loop.time() + SSE_TIMEOUT_SECS
 
-            # ── Parser ────────────────────────────────────────────────────────
-            yield _event({"type": "progress", "page": page_num, "stage": "parsing"})
-            try:
-                parsed = await loop.run_in_executor(
-                    None, orchestrator.parser.parse, img_bytes, page_num
-                )
-            except Exception as e:
-                log.error("parser failed page=%d error=%s", page_num, e)
-                yield _event({"type": "error", "page": page_num, "error": str(e)})
-                continue
+        try:
+            async for message in pubsub.listen():
+                if loop.time() > deadline:
+                    log.warning("SSE timeout upload_id=%s", body.upload_id)
+                    break
+                if message["type"] != "message":
+                    continue
 
-            # ── Validator ─────────────────────────────────────────────────────
-            yield _event({"type": "progress", "page": page_num, "stage": "validating"})
-            try:
-                validated = await loop.run_in_executor(
-                    None, orchestrator.validator.validate, parsed, page_num
-                )
-            except Exception as e:
-                log.error("validator failed page=%d error=%s", page_num, e)
-                yield _event({"type": "error", "page": page_num, "error": str(e)})
-                continue
+                data = json.loads(message["data"])
+                yield _event(data)
 
-            # ── Usage stats ───────────────────────────────────────────────────
-            parser_usage    = parsed.pop("_usage", {})
-            validator_usage = validated.pop("_usage", {})
-            total_cost = parser_usage.get("cost_usd", 0.0) + validator_usage.get("cost_usd", 0.0)
-            log.info(
-                "page_usage upload_id=%s page=%d tokens_in=%d tokens_out=%d cost_usd=%.4f",
-                body.upload_id, page_num,
-                parser_usage.get("input_tokens", 0) + validator_usage.get("input_tokens", 0),
-                parser_usage.get("output_tokens", 0) + validator_usage.get("output_tokens", 0),
-                total_cost,
-            )
+                if data["type"] in ("result", "error"):
+                    received += 1
+                    if received >= total_enqueued:
+                        break
 
-            # ── Build result ──────────────────────────────────────────────────
-            document = validated.get("document", parsed)
-            result = {
-                "doc_type":   document.get("doc_type", "other"),
-                "title":      document.get("title", f"Page {page_num}"),
-                "sections":   document.get("sections", []),
-                "validation": validated.get("validation", {
-                    "overall_confidence": 1.0,
-                    "section_issues": [],
-                }),
-            }
+        finally:
+            await pubsub.unsubscribe(f"extraction:{body.upload_id}")
+            await r.aclose()
 
-            await storage.store_result(body.upload_id, page_num, result)
-            await storage.increment_daily_usage(user_sub)
-
-            # Persist page to DB if document_id was provided
-            if body.document_id:
-                await _upsert_page(body.document_id, page_num, result)
-
-            pages_done += 1
-            log.info(
-                "page extracted upload_id=%s page=%d confidence=%.2f",
-                body.upload_id, page_num,
-                result["validation"].get("overall_confidence", 0),
-            )
-            yield _event({"type": "result", "page": page_num, "data": result})
-
-        # Mark document done in DB
-        if body.document_id and pages_done > 0:
-            await _mark_document_done(body.document_id)
+        if quota_hit:
+            yield _event({
+                "type":        "quota_exceeded",
+                "daily_limit": MAX_PAGES_PER_DAY,
+                "reset_at":    _quota_reset_iso(),
+            })
 
         yield _event({"type": "done"})
-        log.info("extraction complete upload_id=%s", body.upload_id)
+        log.info("extraction stream complete upload_id=%s", body.upload_id)
 
     return EventSourceResponse(generator())

@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
-import { uploadPdf, deleteUpload, extractPages, savePageResult } from '../api/client';
+import { uploadPdf, deleteUpload, extractPages, savePageResult, getDocumentStatus } from '../api/client';
 import type { UploadResponse, PageResult, SSEEvent } from '../api/types';
 import { useAuth } from '../hooks/useAuth';
 import { useDebounce } from '../hooks/useDebounce';
@@ -36,6 +36,8 @@ export default function AppPage() {
   const [extracting, setExtracting] = useState(false);
   const [extractDone, setExtractDone] = useState(false);
   const [quotaMsg, setQuotaMsg] = useState('');
+  const [bgRunning, setBgRunning] = useState(false);
+  const [reextracting, setReextracting] = useState<Set<number>>(new Set());
   const cancelRef = useRef<(() => void) | null>(null);
 
   // Review state
@@ -75,10 +77,32 @@ export default function AppPage() {
     );
   }
 
+  // ── Re-extract a single page in-place ──────────────────────────────────────
+  function reextractPage(pageNum: number) {
+    if (!upload || reextracting.has(pageNum)) return;
+    setReextracting((s) => new Set(s).add(pageNum));
+    extractPages(
+      upload.upload_id,
+      [pageNum],
+      (evt: SSEEvent) => {
+        if (evt.type === 'result') {
+          setResults((prev) => ({ ...prev, [String(evt.page)]: evt.data }));
+          setSaveStatus('saving');
+        }
+        if (evt.type === 'done' || evt.type === 'error') {
+          setReextracting((s) => { const n = new Set(s); n.delete(pageNum); return n; });
+        }
+      },
+      () => setReextracting((s) => { const n = new Set(s); n.delete(pageNum); return n; }),
+      documentId ?? undefined,
+    );
+  }
+
   // ── Upload handlers ─────────────────────────────────────────────────────────
   async function handleFile(file: File) {
-    if (!file.name.toLowerCase().endsWith('.pdf')) {
-      setUploadError('Only PDF files are supported.');
+    const ACCEPTED = ['.pdf', '.jpg', '.jpeg', '.png', '.webp', '.tiff', '.tif'];
+    if (!ACCEPTED.some((ext) => file.name.toLowerCase().endsWith(ext))) {
+      setUploadError('Only PDF and image files (JPG, PNG, WEBP, TIFF) are supported.');
       return;
     }
     setUploading(true);
@@ -138,7 +162,12 @@ export default function AppPage() {
       },
       (msg) => {
         setExtracting(false);
-        setUploadError(msg);
+        // If we have a document ID the worker keeps running — don't treat as fatal error
+        if (documentId) {
+          setBgRunning(true);
+        } else {
+          setUploadError(msg);
+        }
       },
       documentId ?? undefined
     );
@@ -165,6 +194,8 @@ export default function AppPage() {
     setUploadError('');
     setQuotaMsg('');
     setSaveStatus('');
+    setBgRunning(false);
+    setReextracting(new Set());
   }
 
   const resultPages = Object.keys(results).map(Number).sort((a, b) => a - b);
@@ -207,7 +238,7 @@ export default function AppPage() {
           <div className="space-y-6">
             <div>
               <h2 className="text-xl font-semibold text-slate-800">Upload a document</h2>
-              <p className="text-sm text-slate-500 mt-1">Drag & drop a PDF or click to browse</p>
+              <p className="text-sm text-slate-500 mt-1">Drag & drop a PDF or image, or click to browse</p>
             </div>
 
             {!upload ? (
@@ -227,15 +258,15 @@ export default function AppPage() {
                         d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5m-13.5-9L12 3m0 0 4.5 4.5M12 3v13.5" />
                     </svg>
                     <div className="text-center">
-                      <p className="font-medium text-slate-600">Drop your PDF here</p>
-                      <p className="text-sm text-slate-400 mt-1">or click to browse files</p>
+                      <p className="font-medium text-slate-600">Drop your PDF or image here</p>
+                      <p className="text-sm text-slate-400 mt-1">PDF, JPG, PNG, WEBP, TIFF · up to 50 MB</p>
                     </div>
                   </>
                 )}
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept=".pdf"
+                  accept=".pdf,.jpg,.jpeg,.png,.webp,.tiff,.tif,image/*"
                   className="hidden"
                   onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFile(f); }}
                 />
@@ -304,6 +335,29 @@ export default function AppPage() {
               </div>
             )}
 
+            {bgRunning && documentId && (
+              <div className="bg-blue-50 border border-blue-200 rounded-xl px-4 py-3 text-sm text-blue-800 flex items-center justify-between gap-4">
+                <span>Connection lost — extraction is still running in the background.</span>
+                <button
+                  onClick={async () => {
+                    try {
+                      const s = await getDocumentStatus(documentId);
+                      if (s.status === 'done') {
+                        navigate(`/documents/${documentId}`);
+                      } else {
+                        alert(`Still processing: ${s.extracted_pages}/${s.total_pages} pages done.`);
+                      }
+                    } catch {
+                      alert('Could not reach server. Try again shortly.');
+                    }
+                  }}
+                  className="shrink-0 px-3 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-semibold hover:bg-blue-700 transition"
+                >
+                  Check status
+                </button>
+              </div>
+            )}
+
             <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
               <ProgressFeed
                 pageNums={[...selected].sort((a, b) => a - b)}
@@ -333,21 +387,46 @@ export default function AppPage() {
             </div>
 
             {/* Page tabs */}
-            {resultPages.length > 1 && (
-              <div className="flex gap-1 flex-wrap">
-                {resultPages.map((p) => (
+            {resultPages.length > 0 && (
+              <div className="flex items-center gap-2 flex-wrap">
+                <div className="flex gap-1 flex-wrap">
+                  {resultPages.map((p) => (
+                    <button
+                      key={p}
+                      onClick={() => setActivePage(p)}
+                      className={`px-3 py-1.5 rounded-lg text-sm font-medium transition ${
+                        activePage === p
+                          ? 'bg-indigo-600 text-white shadow'
+                          : 'bg-white text-slate-600 border border-slate-200 hover:border-indigo-300'
+                      }`}
+                    >
+                      Page {p}
+                    </button>
+                  ))}
+                </div>
+                {upload && (
                   <button
-                    key={p}
-                    onClick={() => setActivePage(p)}
-                    className={`px-3 py-1.5 rounded-lg text-sm font-medium transition ${
-                      activePage === p
-                        ? 'bg-indigo-600 text-white shadow'
-                        : 'bg-white text-slate-600 border border-slate-200 hover:border-indigo-300'
-                    }`}
+                    onClick={() => reextractPage(activePage)}
+                    disabled={reextracting.has(activePage)}
+                    className="ml-auto px-3 py-1.5 text-sm font-medium rounded-lg border border-slate-200 text-slate-500 hover:border-indigo-300 hover:text-indigo-600 transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
+                    title="Re-run extraction on this page"
                   >
-                    Page {p}
+                    {reextracting.has(activePage) ? (
+                      <>
+                        <span className="w-3 h-3 border-2 border-indigo-400 border-t-transparent rounded-full animate-spin inline-block" />
+                        Re-extracting…
+                      </>
+                    ) : (
+                      <>
+                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                            d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182m0-4.991v4.99" />
+                        </svg>
+                        Re-extract page
+                      </>
+                    )}
                   </button>
-                ))}
+                )}
               </div>
             )}
 

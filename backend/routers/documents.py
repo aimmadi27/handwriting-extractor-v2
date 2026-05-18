@@ -123,6 +123,35 @@ async def get_document(
     }
 
 
+class DocumentRenameRequest(BaseModel):
+    filename: str
+
+
+@router.patch("/{document_id}")
+@limiter.limit("30/minute")
+async def rename_document(
+    request: Request,
+    document_id: str,
+    body: DocumentRenameRequest,
+    user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    user_row = await _get_user_row(db, user["sub"])
+    if not user_row:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    doc = await _require_document(db, document_id, user_row)
+    name = body.filename.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="Filename cannot be empty.")
+
+    doc.filename   = name
+    doc.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    log.info("document renamed document_id=%s user=%s", document_id, user.get("email"))
+    return {"ok": True}
+
+
 @router.delete("/{document_id}")
 @limiter.limit("20/minute")
 async def delete_document(
@@ -141,6 +170,28 @@ async def delete_document(
 
     log.info("document deleted document_id=%s user=%s", document_id, user.get("email"))
     return {"deleted": document_id}
+
+
+@router.get("/{document_id}/status")
+@limiter.limit("60/minute")
+async def get_document_status(
+    request: Request,
+    document_id: str,
+    user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Lightweight status check — used by the frontend when SSE reconnects."""
+    user_row = await _get_user_row(db, user["sub"])
+    if not user_row:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    doc = await _require_document(db, document_id, user_row)
+
+    return {
+        "status":          doc.status,
+        "total_pages":     doc.total_pages,
+        "extracted_pages": len(doc.pages),
+    }
 
 
 class PageUpdateRequest(BaseModel):
