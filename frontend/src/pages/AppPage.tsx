@@ -42,6 +42,26 @@ export default function AppPage() {
   const [results, setResults] = useState<Record<string, PageResult>>({});
   const [activePage, setActivePage] = useState<number>(1);
 
+  // ── Auto-save current page after 1 s of inactivity ─────────────────────────
+  useDebounce(results[String(activePage)], 1000, async (pageData) => {
+    if (!documentId || !pageData || saveStatus !== 'saving') return;
+    try {
+      await savePageResult(documentId, activePage, {
+        title:      pageData.title,
+        sections:   pageData.sections,
+        validation: pageData.validation,
+      });
+      setSaveStatus('saved');
+    } catch {
+      setSaveStatus('');
+    }
+  });
+
+  const handlePageChange = useCallback((updated: PageResult) => {
+    setResults((prev) => ({ ...prev, [String(activePage)]: updated }));
+    setSaveStatus('saving');
+  }, [activePage]);
+
   // ── Auth guard ──────────────────────────────────────────────────────────────
   if (!authLoading && !user) {
     navigate('/', { replace: true });
@@ -130,26 +150,6 @@ export default function AppPage() {
     setActivePage(firstPage);
   }
 
-  // ── Auto-save current page after 1 s of inactivity ─────────────────────────
-  useDebounce(results[String(activePage)], 1000, async (pageData) => {
-    if (!documentId || !pageData || saveStatus !== 'saving') return;
-    try {
-      await savePageResult(documentId, activePage, {
-        title:      pageData.title,
-        sections:   pageData.sections,
-        validation: pageData.validation,
-      });
-      setSaveStatus('saved');
-    } catch {
-      setSaveStatus('');
-    }
-  });
-
-  const handlePageChange = useCallback((updated: PageResult) => {
-    setResults((prev) => ({ ...prev, [String(activePage)]: updated }));
-    setSaveStatus('saving');
-  }, [activePage]);
-
   // ── Reset ───────────────────────────────────────────────────────────────────
   function reset() {
     if (upload) deleteUpload(upload.upload_id);
@@ -181,7 +181,7 @@ export default function AppPage() {
                   d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m0 12.75h7.5M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z" />
               </svg>
             </div>
-            <span className="font-semibold text-slate-800">Handwriting Extractor</span>
+            <span className="font-semibold text-slate-800">InkScan</span>
           </div>
           <Link to="/history" className="text-sm text-slate-500 hover:text-slate-800 transition hidden sm:inline">
             History

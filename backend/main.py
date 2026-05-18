@@ -14,8 +14,8 @@ load_dotenv()
 setup_logging()
 
 app = FastAPI(
-    title="Handwriting Extractor API",
-    description="Multi-agent pipeline for digitising any handwritten document.",
+    title="InkScan API",
+    description="AI-powered handwriting digitisation pipeline.",
     version="2.0.0",
 )
 

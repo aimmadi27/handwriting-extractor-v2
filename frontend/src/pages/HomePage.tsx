@@ -32,7 +32,7 @@ export default function HomePage() {
 
         {/* Heading */}
         <div>
-          <h1 className="text-4xl font-bold tracking-tight">Handwriting Extractor</h1>
+          <h1 className="text-4xl font-bold tracking-tight">InkScan</h1>
           <p className="mt-3 text-slate-400 text-lg">
             Upload any handwritten document. Get a structured, editable digital version instantly.
           </p>
