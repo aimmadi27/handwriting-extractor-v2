@@ -19,10 +19,14 @@ from models import Base  # noqa: E402
 
 target_metadata = Base.metadata
 
-DATABASE_URL = os.getenv(
+def _async_url(url: str) -> str:
+    return url.replace("postgresql://", "postgresql+asyncpg://", 1) \
+              .replace("postgres://", "postgresql+asyncpg://", 1)
+
+DATABASE_URL = _async_url(os.getenv(
     "DATABASE_URL",
     "postgresql+asyncpg://app:password@localhost:5432/handwriting",
-)
+))
 
 
 def do_run_migrations(connection):
