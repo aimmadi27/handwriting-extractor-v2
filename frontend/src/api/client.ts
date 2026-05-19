@@ -71,6 +71,15 @@ export async function uploadPdf(file: File): Promise<UploadResponse> {
   return res.json();
 }
 
+export async function combineImages(files: File[]): Promise<UploadResponse> {
+  const form = new FormData();
+  for (const f of files) form.append('files', f);
+  const res = await checkResponse(
+    await apiFetch(`${BASE}/upload/combine`, { method: 'POST', body: form })
+  );
+  return res.json();
+}
+
 export async function deleteUpload(uploadId: string): Promise<void> {
   await apiFetch(`${BASE}/upload/${uploadId}`, { method: 'DELETE' });
 }

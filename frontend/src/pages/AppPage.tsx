@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
-import { uploadPdf, deleteUpload, extractPages, savePageResult, getDocumentStatus } from '../api/client';
+import { uploadPdf, combineImages, deleteUpload, extractPages, savePageResult, getDocumentStatus } from '../api/client';
 import type { UploadResponse, PageResult, SSEEvent } from '../api/types';
 import { useAuth } from '../hooks/useAuth';
 import { useDebounce } from '../hooks/useDebounce';
@@ -8,13 +8,28 @@ import PagePicker from '../components/PagePicker';
 import ProgressFeed, { eventToStatus } from '../components/ProgressFeed';
 import SectionEditor from '../components/SectionEditor';
 import ExportBar from '../components/ExportBar';
+import BatchQueue from '../components/BatchQueue';
 
-type Step = 'upload' | 'extract' | 'review';
+type Step = 'upload' | 'extract' | 'review' | 'batch';
 
 interface PageStatus {
   stage: 'waiting' | 'parsing' | 'validating' | 'done' | 'error';
   error?: string;
 }
+
+export interface BatchItem {
+  localId: string;
+  file: File;
+  uploadPhase: 'pending' | 'uploading' | 'done' | 'error';
+  uploadResult?: UploadResponse;
+  extractPhase: 'idle' | 'running' | 'done' | 'error';
+  donePages: number;
+  error?: string;
+}
+
+const IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.webp', '.tiff', '.tif'];
+const ACCEPTED_EXTS = ['.pdf', ...IMAGE_EXTS];
+
 
 export default function AppPage() {
   const { user, loading: authLoading, logout } = useAuth();
@@ -43,6 +58,11 @@ export default function AppPage() {
   // Review state
   const [results, setResults] = useState<Record<string, PageResult>>({});
   const [activePage, setActivePage] = useState<number>(1);
+
+  // Batch state
+  const [batchItems, setBatchItems] = useState<BatchItem[]>([]);
+  const [batchExtracting, setBatchExtracting] = useState(false);
+  const [combineMode, setCombineMode] = useState(false);
 
   // ── Auto-save current page after 1 s of inactivity ─────────────────────────
   useDebounce(results[String(activePage)], 1000, async (pageData) => {
@@ -98,10 +118,9 @@ export default function AppPage() {
     );
   }
 
-  // ── Upload handlers ─────────────────────────────────────────────────────────
+  // ── Single-file upload handler ──────────────────────────────────────────────
   async function handleFile(file: File) {
-    const ACCEPTED = ['.pdf', '.jpg', '.jpeg', '.png', '.webp', '.tiff', '.tif'];
-    if (!ACCEPTED.some((ext) => file.name.toLowerCase().endsWith(ext))) {
+    if (!ACCEPTED_EXTS.some((ext) => file.name.toLowerCase().endsWith(ext))) {
       setUploadError('Only PDF and image files (JPG, PNG, WEBP, TIFF) are supported.');
       return;
     }
@@ -120,13 +139,147 @@ export default function AppPage() {
     }
   }
 
-  function handleDrop(e: React.DragEvent) {
-    e.preventDefault();
-    const file = e.dataTransfer.files[0];
-    if (file) handleFile(file);
+  // ── Multi-file handler ──────────────────────────────────────────────────────
+  async function handleFiles(files: File[]) {
+    if (files.length === 0) return;
+    if (files.length === 1) { handleFile(files[0]); return; }
+
+    // Validate all files
+    const invalid = files.find(
+      (f) => !ACCEPTED_EXTS.some((ext) => f.name.toLowerCase().endsWith(ext))
+    );
+    if (invalid) {
+      setUploadError(`Unsupported file: ${invalid.name}`);
+      return;
+    }
+
+    setUploadError('');
+
+    // If combine mode is on, all files must be images
+    if (combineMode) {
+      const hasPdf = files.some((f) => f.name.toLowerCase().endsWith('.pdf'));
+      if (hasPdf) {
+        setUploadError('Combine mode only works with images, not PDFs.');
+        return;
+      }
+      setUploading(true);
+      try {
+        const res = await combineImages(files);
+        setUpload(res);
+        setDocumentId(res.document_id ?? null);
+        setSelected(new Set(Array.from({ length: res.total_pages }, (_, i) => i + 1)));
+        setStep('upload');
+      } catch (e: unknown) {
+        setUploadError((e as Error).message);
+      } finally {
+        setUploading(false);
+      }
+      return;
+    }
+
+    // Batch mode — upload each file independently
+    const items: BatchItem[] = files.map((f) => ({
+      localId:      crypto.randomUUID(),
+      file:         f,
+      uploadPhase:  'pending',
+      extractPhase: 'idle',
+      donePages:    0,
+    }));
+    setBatchItems(items);
+    setStep('batch');
+
+    // Upload each file, updating status per item
+    for (let i = 0; i < items.length; i++) {
+      setBatchItems((prev) =>
+        prev.map((it, idx) => idx === i ? { ...it, uploadPhase: 'uploading' } : it)
+      );
+      try {
+        const res = await uploadPdf(items[i].file);
+        setBatchItems((prev) =>
+          prev.map((it, idx) =>
+            idx === i ? { ...it, uploadPhase: 'done', uploadResult: res } : it
+          )
+        );
+      } catch (e: unknown) {
+        setBatchItems((prev) =>
+          prev.map((it, idx) =>
+            idx === i ? { ...it, uploadPhase: 'error', error: (e as Error).message } : it
+          )
+        );
+      }
+    }
   }
 
-  // ── Extract ─────────────────────────────────────────────────────────────────
+  // ── Batch extract ───────────────────────────────────────────────────────────
+  function startBatchExtract() {
+    setBatchExtracting(true);
+    const readyItems = batchItems.filter((it) => it.uploadPhase === 'done' && it.uploadResult);
+
+    readyItems.forEach((item) => {
+      const res = item.uploadResult!;
+      const pageNums = Array.from({ length: res.total_pages }, (_, i) => i + 1);
+
+      setBatchItems((prev) =>
+        prev.map((it) => it.localId === item.localId ? { ...it, extractPhase: 'running' } : it)
+      );
+
+      extractPages(
+        res.upload_id,
+        pageNums,
+        (evt: SSEEvent) => {
+          if (evt.type === 'result' || evt.type === 'error') {
+            setBatchItems((prev) =>
+              prev.map((it) =>
+                it.localId === item.localId
+                  ? { ...it, donePages: it.donePages + 1 }
+                  : it
+              )
+            );
+          }
+          if (evt.type === 'done') {
+            setBatchItems((prev) =>
+              prev.map((it) =>
+                it.localId === item.localId ? { ...it, extractPhase: 'done' } : it
+              )
+            );
+            checkAllBatchDone();
+          }
+        },
+        () => {
+          setBatchItems((prev) =>
+            prev.map((it) =>
+              it.localId === item.localId
+                ? { ...it, extractPhase: 'error', error: 'Extraction failed' }
+                : it
+            )
+          );
+          checkAllBatchDone();
+        },
+        res.document_id,
+      );
+    });
+
+    function checkAllBatchDone() {
+      setBatchItems((prev) => {
+        const allSettled = prev.every(
+          (it) => it.uploadPhase === 'error' ||
+                  it.extractPhase === 'done' ||
+                  it.extractPhase === 'error'
+        );
+        if (allSettled) setBatchExtracting(false);
+        return prev;
+      });
+    }
+  }
+
+  function handleDrop(e: React.DragEvent) {
+    e.preventDefault();
+    const files = Array.from(e.dataTransfer.files);
+    if (files.length > 1) handleFiles(files);
+    else if (files.length === 1) handleFile(files[0]);
+  }
+
+  // ── Extract (single) ────────────────────────────────────────────────────────
   function startExtract() {
     if (!upload || selected.size === 0) return;
     const pageNums = [...selected].sort((a, b) => a - b);
@@ -162,7 +315,6 @@ export default function AppPage() {
       },
       (msg) => {
         setExtracting(false);
-        // If we have a document ID the worker keeps running — don't treat as fatal error
         if (documentId) {
           setBgRunning(true);
         } else {
@@ -196,9 +348,13 @@ export default function AppPage() {
     setSaveStatus('');
     setBgRunning(false);
     setReextracting(new Set());
+    setBatchItems([]);
+    setBatchExtracting(false);
   }
 
   const resultPages = Object.keys(results).map(Number).sort((a, b) => a - b);
+  const allBatchUploaded = batchItems.length > 0 &&
+    batchItems.every((it) => it.uploadPhase === 'done' || it.uploadPhase === 'error');
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col">
@@ -236,9 +392,23 @@ export default function AppPage() {
         {/* ── UPLOAD STEP ─────────────────────────────────────────────────── */}
         {step === 'upload' && (
           <div className="space-y-6">
-            <div>
-              <h2 className="text-xl font-semibold text-slate-800">Upload a document</h2>
-              <p className="text-sm text-slate-500 mt-1">Drag & drop a PDF or image, or click to browse</p>
+            <div className="flex items-start justify-between flex-wrap gap-3">
+              <div>
+                <h2 className="text-xl font-semibold text-slate-800">Upload a document</h2>
+                <p className="text-sm text-slate-500 mt-1">Drag & drop files or click to browse</p>
+              </div>
+              {/* Combine toggle — visible when drop zone is empty */}
+              {!upload && (
+                <label className="flex items-center gap-2 cursor-pointer select-none">
+                  <div
+                    onClick={() => setCombineMode((v) => !v)}
+                    className={`relative w-9 h-5 rounded-full transition-colors ${combineMode ? 'bg-indigo-500' : 'bg-slate-200'}`}
+                  >
+                    <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${combineMode ? 'translate-x-4' : ''}`} />
+                  </div>
+                  <span className="text-sm text-slate-600">Combine images into one doc</span>
+                </label>
+              )}
             </div>
 
             {!upload ? (
@@ -258,7 +428,9 @@ export default function AppPage() {
                         d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5m-13.5-9L12 3m0 0 4.5 4.5M12 3v13.5" />
                     </svg>
                     <div className="text-center">
-                      <p className="font-medium text-slate-600">Drop your PDF or image here</p>
+                      <p className="font-medium text-slate-600">
+                        {combineMode ? 'Drop multiple images to combine' : 'Drop files here — one or many'}
+                      </p>
                       <p className="text-sm text-slate-400 mt-1">PDF, JPG, PNG, WEBP, TIFF · up to 50 MB</p>
                     </div>
                   </>
@@ -267,8 +439,14 @@ export default function AppPage() {
                   ref={fileInputRef}
                   type="file"
                   accept=".pdf,.jpg,.jpeg,.png,.webp,.tiff,.tif,image/*"
+                  multiple
                   className="hidden"
-                  onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFile(f); }}
+                  onChange={(e) => {
+                    const files = Array.from(e.target.files ?? []);
+                    if (files.length > 1) handleFiles(files);
+                    else if (files.length === 1) handleFile(files[0]);
+                    e.target.value = '';
+                  }}
                 />
               </div>
             ) : (
@@ -307,6 +485,17 @@ export default function AppPage() {
 
             {uploadError && <p className="text-sm text-red-500">{uploadError}</p>}
           </div>
+        )}
+
+        {/* ── BATCH STEP ──────────────────────────────────────────────────── */}
+        {step === 'batch' && (
+          <BatchQueue
+            items={batchItems}
+            extracting={batchExtracting}
+            allUploaded={allBatchUploaded}
+            onExtractAll={startBatchExtract}
+            onReset={reset}
+          />
         )}
 
         {/* ── EXTRACT STEP ────────────────────────────────────────────────── */}
@@ -409,7 +598,6 @@ export default function AppPage() {
                     onClick={() => reextractPage(activePage)}
                     disabled={reextracting.has(activePage)}
                     className="ml-auto px-3 py-1.5 text-sm font-medium rounded-lg border border-slate-200 text-slate-500 hover:border-indigo-300 hover:text-indigo-600 transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
-                    title="Re-run extraction on this page"
                   >
                     {reextracting.has(activePage) ? (
                       <>
@@ -465,6 +653,13 @@ export default function AppPage() {
           </div>
         )}
       </main>
+
+      {/* Combine-mode info banner (shown when no file loaded yet) */}
+      {step === 'upload' && !upload && combineMode && (
+        <div className="fixed bottom-0 inset-x-0 bg-indigo-600 text-white text-sm text-center py-2 px-4">
+          Combine mode on — drop 2–50 images to merge them into one multi-page document
+        </div>
+      )}
     </div>
   );
 }
