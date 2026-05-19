@@ -89,7 +89,7 @@ async def upload_file(
         thumb.save(thumb_buf, "PNG")
         thumbnails.append(base64.b64encode(thumb_buf.getvalue()).decode())
 
-    await storage.store_upload(upload_id, file.filename, page_images)
+    await storage.store_upload(upload_id, file.filename, page_images, user_sub=user.get("sub", ""))
 
     user_db_id = uuid.UUID(user["user_id"])
     doc = Document(user_id=user_db_id, filename=file.filename, total_pages=len(pil_pages), status="uploaded")
@@ -160,7 +160,7 @@ async def combine_images(
 
     combined_name = f"combined_{files[0].filename}"
     upload_id     = str(uuid.uuid4())
-    await storage.store_upload(upload_id, combined_name, page_images)
+    await storage.store_upload(upload_id, combined_name, page_images, user_sub=user.get("sub", ""))
 
     user_db_id = uuid.UUID(user["user_id"])
     doc = Document(user_id=user_db_id, filename=combined_name, total_pages=len(page_images), status="uploaded")
@@ -184,6 +184,8 @@ async def combine_images(
 
 @router.delete("/{upload_id}")
 async def delete_upload(upload_id: str, user: dict = Depends(get_current_user)):
+    if not await storage.upload_owned_by(upload_id, user.get("sub", "")):
+        raise HTTPException(status_code=404, detail="Upload not found.")
     await storage.delete_upload(upload_id)
     log.info("upload deleted upload_id=%s user=%s", upload_id, user.get("email"))
     return {"deleted": upload_id}

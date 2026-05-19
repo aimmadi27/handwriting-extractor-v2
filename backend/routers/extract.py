@@ -62,11 +62,12 @@ async def extract(
       {"type": "quota_exceeded", "daily_limit": N, "reset_at": "<iso>"}
       {"type": "done"}
     """
-    if not await storage.upload_exists(body.upload_id):
-        raise HTTPException(status_code=404, detail="Upload not found. Please upload the PDF first.")
-
-    meta     = await storage.get_upload_meta(body.upload_id)
     user_sub = user.get("sub", "anonymous")
+
+    if not await storage.upload_owned_by(body.upload_id, user_sub):
+        raise HTTPException(status_code=404, detail="Upload not found. Please upload the file first.")
+
+    meta = await storage.get_upload_meta(body.upload_id)
 
     # ── Quota check ───────────────────────────────────────────────────────────
     daily_used      = await storage.get_daily_usage(user_sub)

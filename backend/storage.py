@@ -25,10 +25,20 @@ async def upload_exists(upload_id: str) -> bool:
     return bool(await _r().exists(f"upload:{upload_id}:meta"))
 
 
-async def store_upload(upload_id: str, filename: str, page_images: list[bytes]) -> None:
+async def upload_owned_by(upload_id: str, user_sub: str) -> bool:
+    """Return True if the upload exists and was created by user_sub."""
+    meta = await get_upload_meta(upload_id)
+    if not meta:
+        return False
+    stored = meta.get("user_sub", "")
+    # Legacy uploads without user_sub are considered unowned — deny access.
+    return stored == user_sub
+
+
+async def store_upload(upload_id: str, filename: str, page_images: list[bytes], user_sub: str = "") -> None:
     r = _r()
     pipe = r.pipeline()
-    meta = json.dumps({"filename": filename, "total_pages": len(page_images)})
+    meta = json.dumps({"filename": filename, "total_pages": len(page_images), "user_sub": user_sub})
     pipe.set(f"upload:{upload_id}:meta", meta, ex=UPLOAD_TTL)
     for i, img in enumerate(page_images, start=1):
         pipe.set(f"upload:{upload_id}:page:{i}", img, ex=UPLOAD_TTL)
